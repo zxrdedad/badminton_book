@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+3#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 浙江警察学院 羽毛球馆自动预约脚本
@@ -14,6 +14,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple, List
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import urllib3
 
@@ -28,6 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
@@ -46,6 +48,50 @@ API_BASE = _cfg["api_base"]
 CAS_BASE = _cfg["cas_base"]
 VENUE_ID = _cfg["venue_id"]
 SERVICE_URL = f"{API_BASE}/cas/login"
+NETWORK_MODE = _cfg.get("network_mode", "direct")
+
+WEBVPN_BASE = "https://webvpn.zjjcxy.cn"
+
+_WEBVPN_KEY_HEX = "909721fc475008301e68e9ccf83543551074948a88d23ec6e2"
+_WEBVPN_KEY_BYTES = bytes.fromhex(_WEBVPN_KEY_HEX)
+_WEBVPN_PREFIX_HEX = "77726476706e69737468656265737421"
+
+
+def webvpn_encode(host: str) -> str:
+    data = host.encode('ascii')
+    result = bytearray()
+    for i, b in enumerate(data):
+        result.append(b ^ _WEBVPN_KEY_BYTES[i % len(_WEBVPN_KEY_BYTES)])
+    return _WEBVPN_PREFIX_HEX + result.hex()
+
+
+def _to_webvpn_url(internal_url: str) -> str:
+    parsed = urlparse(internal_url)
+    scheme = parsed.scheme
+    host = parsed.hostname
+    port = parsed.port
+    path = parsed.path
+    query = f"?{parsed.query}" if parsed.query else ""
+
+    encoded_host = webvpn_encode(host)
+    scheme_prefix = f"/{scheme}"
+
+    port_suffix = f"/{port}" if port else ""
+    if path.startswith("/"):
+        path = path[1:]
+    path_suffix = f"/{path}" if path else ""
+
+    return f"{WEBVPN_BASE}{scheme_prefix}/{encoded_host}{port_suffix}{path_suffix}{query}"
+
+
+def _webvpn_encrypt_password(password: str) -> str:
+    from Crypto.Cipher import AES
+    aes_key = b"wrdvpnisawesome!"
+    aes_iv = b"wrdvpnisawesome!"
+    padded = password + "0" * (16 - len(password) % 16) if len(password) % 16 != 0 else password
+    cipher = AES.new(aes_key, AES.MODE_CFB, aes_iv, segment_size=128)
+    encrypted = cipher.encrypt(padded.encode("utf-8"))
+    return aes_iv.hex() + encrypted.hex()[:len(password) * 2]
 
 
 class CASClient:
@@ -59,7 +105,7 @@ class CASClient:
 
     def login(self, username: str, password: str) -> bool:
         logger.info("=" * 50)
-        logger.info("开始CAS登录")
+        logger.info("开始CAS登录 (内网直连模式)")
 
         try:
             cas_login_url = f"{CAS_BASE}/cas/login?service={SERVICE_URL}"
@@ -118,13 +164,7 @@ class CASClient:
                 return False
 
             self.token = match.group(1)
-            self.session.headers.update({
-                'Authorization': self.token,
-                'Origin': 'https://attendence.yyhj.zjjcxy.cn',
-                'Referer': 'https://attendence.yyhj.zjjcxy.cn/',
-                'Accept': 'application/json, text/plain, */*',
-                'Content-Type': 'application/json'
-            })
+            self._set_auth_headers('https://attendence.yyhj.zjjcxy.cn')
             logger.info(f"  Token: {self.token[:40]}...")
 
             if self._verify():
@@ -142,6 +182,15 @@ class CASClient:
             import traceback
             logger.error(traceback.format_exc())
             return False
+
+    def _set_auth_headers(self, origin: str):
+        self.session.headers.update({
+            'Authorization': self.token,
+            'Origin': origin,
+            'Referer': origin + '/',
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json'
+        })
 
     def _verify(self) -> bool:
         try:
@@ -162,6 +211,243 @@ class CASClient:
         return self.session.post(url, **kwargs)
 
 
+class WebVPNCASClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        })
+        self.session.verify = False
+        self.token: Optional[str] = None
+
+        self.api_vpn_base = _to_webvpn_url(API_BASE)
+        self.cas_vpn_base = _to_webvpn_url(CAS_BASE)
+        self.service_vpn_url = _to_webvpn_url(SERVICE_URL)
+        self.origin_vpn = _to_webvpn_url('https://attendence.yyhj.zjjcxy.cn')
+
+    def login(self, username: str, password: str) -> bool:
+        logger.info("=" * 50)
+        logger.info("开始WebVPN代理模式登录")
+
+        if not self._login_webvpn(username, password):
+            return False
+
+        if not self._login_cas(username, password):
+            return False
+
+        return True
+
+    def _login_webvpn(self, username: str, password: str) -> bool:
+        logger.info("[WebVPN] 步骤1: 登录WebVPN...")
+        try:
+            resp = self.session.get(f"{WEBVPN_BASE}/login", timeout=30)
+
+            captcha_id_match = re.search(r'name="captcha_id"\s+value="([^"]+)"', resp.text)
+            if not captcha_id_match:
+                logger.error("无法获取WebVPN captcha_id")
+                return False
+            captcha_id = captcha_id_match.group(1)
+
+            need_captcha_match = re.search(r'name="needCaptcha"\s+value="([^"]+)"', resp.text)
+            need_captcha = need_captcha_match and need_captcha_match.group(1) == "true"
+
+            encrypted_pwd = _webvpn_encrypt_password(password)
+
+            data = [("username", username), ("password", encrypted_pwd), ("captcha_id", captcha_id)]
+            if need_captcha:
+                logger.warning("WebVPN需要验证码!")
+                captcha_url = f"{WEBVPN_BASE}/captcha/{captcha_id}.png"
+                resp = self.session.get(captcha_url, timeout=30)
+                captcha_path = os.path.join(BASE_DIR, "captcha.png")
+                with open(captcha_path, "wb") as f:
+                    f.write(resp.content)
+                captcha_code = input("请查看 captcha.png 并输入验证码: ").strip()
+                data.append(("captcha", captcha_code))
+
+            resp = self.session.post(f"{WEBVPN_BASE}/do-login", data=data, timeout=30)
+            try:
+                result = resp.json()
+            except Exception:
+                logger.error(f"WebVPN登录响应异常: {resp.text[:200]}")
+                return False
+
+            if not result.get("success"):
+                error = result.get("error", "")
+                message = result.get("message", "")
+                if error == "NEED_CONFIRM":
+                    logger.info("账号在其他设备登录, 正在确认...")
+                    resp = self.session.post(f"{WEBVPN_BASE}/do-confirm-login", timeout=30)
+                    try:
+                        if resp.json().get("success"):
+                            logger.info("WebVPN登录成功!")
+                        else:
+                            logger.error("确认登录失败")
+                            return False
+                    except Exception:
+                        logger.error("确认登录失败")
+                        return False
+                else:
+                    logger.error(f"WebVPN登录失败: [{error}] {message}")
+                    return False
+            else:
+                logger.info("WebVPN登录成功!")
+                redirect_url = result.get("url", "/")
+                if redirect_url.startswith("/"):
+                    redirect_url = WEBVPN_BASE + redirect_url
+                self.session.get(redirect_url, timeout=30)
+
+            return True
+        except Exception as e:
+            logger.error(f"WebVPN登录异常: {e}")
+            return False
+
+    def _login_cas(self, username: str, password: str) -> bool:
+        logger.info("[WebVPN] 步骤2: CAS登录...")
+        try:
+            cas_login_url = f"{self.cas_vpn_base}/cas/login?service={SERVICE_URL}"
+            logger.info(f"  获取CAS登录页...")
+            logger.info(f"  CAS URL: {cas_login_url[:120]}")
+            resp = self._follow_redirects(cas_login_url)
+            logger.info(f"  状态码: {resp.status_code}, URL: {resp.url[:120]}")
+
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            execution_input = soup.find("input", {"name": "execution"})
+            if not execution_input:
+                logger.error("未找到execution参数")
+                logger.debug(f"页面内容(前500): {resp.text[:500]}")
+                return False
+            execution = execution_input["value"]
+
+            logger.info(f"  提交CAS登录 (用户: {username})")
+            cas_post_url = resp.url
+            resp = self.session.post(
+                cas_post_url,
+                data={
+                    "username": username,
+                    "password": password,
+                    "execution": execution,
+                    "_eventId": "submit",
+                    "geolocation": ""
+                },
+                headers={
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Referer': cas_post_url,
+                },
+                allow_redirects=False,
+                timeout=30
+            )
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                redirect_url = resp.headers.get("Location", "")
+                logger.info(f"  CAS重定向: {redirect_url[:120]}")
+                if redirect_url:
+                    if redirect_url.startswith("/"):
+                        redirect_url = urljoin(resp.url, redirect_url)
+                    if not redirect_url.startswith(WEBVPN_BASE):
+                        redirect_url = _to_webvpn_url(redirect_url)
+                    resp = self._follow_redirects(redirect_url)
+            elif resp.status_code != 200:
+                logger.error(f"  CAS登录失败, 状态码: {resp.status_code}")
+                return False
+
+            logger.info("  解析Token...")
+            match = re.search(
+                r"""setCookie\(["']EL-ADMIN-TOEKN["'],["'](Bearer .*?)["']\)""",
+                resp.text
+            )
+            if not match:
+                match = re.search(
+                    r"""["']EL-ADMIN-TOEKN["'],["'](Bearer .*?)["']""",
+                    resp.text
+                )
+
+            if not match:
+                logger.error("解析Token失败")
+                logger.debug(f"响应内容(前500): {resp.text[:500]}")
+                return False
+
+            self.token = match.group(1)
+            self._set_auth_headers(self.origin_vpn)
+            logger.info(f"  Token: {self.token[:40]}...")
+
+            if self._verify():
+                logger.info("WebVPN登录验证通过!")
+            else:
+                logger.warning("Token验证失败, 但继续尝试")
+            return True
+
+        except Exception as e:
+            logger.error(f"CAS登录异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    def _follow_redirects(self, url: str, max_redirects: int = 10) -> requests.Response:
+        html_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+        resp = self.session.get(url, headers=html_headers, timeout=30, allow_redirects=False)
+        for i in range(max_redirects):
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                break
+            location = resp.headers.get("Location", "")
+            if not location:
+                break
+            if location.startswith("/"):
+                location = urljoin(resp.url, location)
+            if location.startswith(WEBVPN_BASE):
+                logger.info(f"  重定向[{i+1}] (WebVPN): {location[:120]}")
+                resp = self.session.get(location, headers=html_headers, timeout=30, allow_redirects=False)
+            elif any(d in location for d in ("zjjcxy.cn",)):
+                vpn_url = _to_webvpn_url(location)
+                logger.info(f"  重定向[{i+1}]: {location[:80]} -> {vpn_url[:80]}")
+                resp = self.session.get(vpn_url, headers=html_headers, timeout=30, allow_redirects=False)
+            else:
+                logger.info(f"  重定向[{i+1}] 跳出(外部): {location[:120]}")
+                break
+        return resp
+
+    def _set_auth_headers(self, origin: str):
+        self.session.headers.update({
+            'Authorization': self.token,
+            'Origin': origin,
+            'Referer': origin + '/',
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json'
+        })
+
+    def _verify(self) -> bool:
+        try:
+            url = f"{self.api_vpn_base}/api/reserveSessions/query"
+            resp = self.session.get(
+                url,
+                params={'venueId': VENUE_ID, 'day': datetime.now().strftime('%Y-%m-%d')},
+                timeout=10
+            )
+            return resp.status_code == 200
+        except:
+            return False
+
+    def get(self, url: str, **kwargs):
+        vpn_url = _to_webvpn_url(url) if not url.startswith(WEBVPN_BASE) else url
+        return self.session.get(vpn_url, **kwargs)
+
+    def post(self, url: str, **kwargs):
+        vpn_url = _to_webvpn_url(url) if not url.startswith(WEBVPN_BASE) else url
+        return self.session.post(vpn_url, **kwargs)
+
+
+def create_client() -> CASClient:
+    if NETWORK_MODE == "webvpn":
+        logger.info("网络模式: WebVPN代理")
+        return WebVPNCASClient()
+    else:
+        logger.info("网络模式: 内网直连")
+        return CASClient()
+
+
 class Reservation:
     def __init__(self, client: CASClient):
         self.client = client
@@ -173,11 +459,16 @@ class Reservation:
                 params={'venueId': VENUE_ID, 'day': day},
                 timeout=10
             )
+            logger.info(f"查询响应: HTTP {resp.status_code}, URL: {resp.url[:150]}")
             if resp.status_code == 200:
-                data = resp.json()
-                return data if isinstance(data, list) else []
+                try:
+                    data = resp.json()
+                    return data if isinstance(data, list) else []
+                except Exception:
+                    logger.error(f"响应非JSON: {resp.text[:300]}")
+                    return []
             else:
-                logger.warning(f"查询时段失败: HTTP {resp.status_code}")
+                logger.warning(f"查询时段失败: HTTP {resp.status_code}, 响应: {resp.text[:200]}")
         except Exception as e:
             logger.error(f"查询异常: {e}")
         return []
@@ -437,12 +728,12 @@ def main():
     m = input("\n选项: ").strip()
 
     if m == '3':
-        client = CASClient()
+        client = create_client()
         reservation = Reservation(client)
         do_schedule_reserve(reservation, RESERVE_CONFIG)
 
     elif m == '2':
-        client = CASClient()
+        client = create_client()
         if not client.login(USERNAME, PASSWORD):
             return
 
@@ -473,7 +764,7 @@ def main():
             print(f"\n{'成功' if ok else '失败'}: {msg}")
 
     else:
-        client = CASClient()
+        client = create_client()
         if not client.login(USERNAME, PASSWORD):
             return
 

@@ -26,6 +26,7 @@ pip install -r requirements.txt
 {
     "username": "你的学号",
     "password": "你的密码",
+    "network_mode": "direct",
     "reserve": {
         "target_time": "19:50",
         "target_scene": "场次7",
@@ -49,6 +50,7 @@ pip install -r requirements.txt
 | 字段 | 说明 |
 |------|------|
 | `username` / `password` | CAS 登录账号密码 |
+| `network_mode` | 网络模式：`direct`（内网直连）或 `webvpn`（WebVPN 代理） |
 | `reserve.target_time` | 目标时段 |
 | `reserve.target_scene` | 目标场次 |
 | `reserve.preferred_court` | 首选场地编号 |
@@ -57,6 +59,11 @@ pip install -r requirements.txt
 | `schedule.advance_login` | 提前多少秒登录 |
 | `schedule.max_retries` | 最大重试次数 |
 | `schedule.retry_interval` | 重试间隔（秒） |
+
+### 网络模式
+
+- **`direct`**（默认）— 在校园内网环境直接访问，适用于校内电脑
+- **`webvpn`** — 通过学校 WebVPN 代理访问，适用于外网服务器（如腾讯云）
 
 ## 使用
 
